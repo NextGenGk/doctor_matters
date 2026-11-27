@@ -90,10 +90,12 @@
     },
     "extra": {
       "router": {},
+      "clerkPublishableKey": "",
+      "apiUrl": "",
       "eas": {
-        "projectId": "c44aa44d-9024-470c-be75-854a2450271f"
+        "projectId": "dd5a8f5f-5b66-4020-8850-9aa927903eb7"
       }
     },
-    "owner": "biryanidev"
+    "owner": "bluxh"
   }
 }
