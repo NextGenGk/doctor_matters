@@ -3,6 +3,45 @@ import sql from '@/lib/db';
 import { z } from 'zod';
 import { checkRateLimit } from '@/lib/rate-limit';
 import { requireDoctor, requireOwnAppointment } from '@/lib/authz';
+import { closeOpenCallForAppointment, hasOpenCallForAppointment } from '@/lib/callSessions';
+import { notifyOnce, PATIENT_PUSH_CHANNEL, DOCTOR_PUSH_CHANNEL } from '@/lib/shared/notifications/inApp';
+
+/**
+ * Delegates patient/doctor in-app notification creation and Expo push to the
+ * patient backend. Both backends share the database, but only the patient
+ * backend has EXPO_ACCESS_TOKEN, so doctor actions must go through this service
+ * hop to reach a patient's device.
+ */
+async function notifyPatientBackend(payload: Record<string, unknown>): Promise<boolean> {
+    const patientApi = process.env.PATIENT_API_URL;
+    const serviceSecret = process.env.INTERNAL_SERVICE_SECRET;
+
+    if (!patientApi || !serviceSecret) {
+        console.warn('[appointments] PATIENT_API_URL or INTERNAL_SERVICE_SECRET unset; push notification skipped');
+        return false;
+    }
+
+    try {
+        const response = await fetch(`${patientApi.replace(/\/$/, '')}/api/notifications/send`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-service-secret': serviceSecret,
+            },
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(8000),
+        });
+
+        if (!response.ok) {
+            console.error(`[appointments] notification service failed: ${response.status} ${await response.text().catch(() => '')}`);
+            return false;
+        }
+        return true;
+    } catch (error) {
+        console.error('[appointments] notification service error:', error);
+        return false;
+    }
+}
 
 const updateSchema = z.object({
     aid: z.string().uuid(),
@@ -36,7 +75,14 @@ export async function GET(request: NextRequest) {
                    rr.amount as refund_amount,
                    rr.reason as refund_reason,
                    rr.status as refund_status,
-                   (rr.refund_id IS NOT NULL) as refund_requested
+                   (rr.refund_id IS NOT NULL) as refund_requested,
+                   (((a.scheduled_date + a.scheduled_time) AT TIME ZONE 'Asia/Kolkata') - interval '10 minutes') AS call_opens_at,
+                   (
+                       a.mode = 'online'
+                       AND a.status IN ('confirmed', 'in_progress')
+                       AND NOW() >= (((a.scheduled_date + a.scheduled_time) AT TIME ZONE 'Asia/Kolkata') - interval '10 minutes')
+                   ) AS call_available,
+                   NOW() AS server_time
             FROM appointments a
             LEFT JOIN refund_requests rr ON a.aid = rr.aid
             WHERE a.did = ${doctor.did}
@@ -50,26 +96,30 @@ export async function GET(request: NextRequest) {
         const patientIds = [...new Set(allAppointments.map(apt => apt.pid))];
         const appointmentIds = allAppointments.map(apt => apt.aid);
 
-        const patients = await sql`
-            SELECT p.pid, p.uid, u.name, u.email, u.phone, u.profile_image_url
-            FROM patients p JOIN users u ON p.uid = u.uid
-            WHERE p.pid = ANY(${patientIds}::uuid[])
-        `;
-
-        // Count unread patient messages for each appointment
-        const unreadCounts = await sql`
-            SELECT aid, COUNT(*)::int as count
-            FROM appointment_messages
-            WHERE aid = ANY(${appointmentIds}::uuid[])
-              AND sender_role = 'patient'
-              AND read_at IS NULL
-            GROUP BY aid
-        `;
+        // These reads are independent; parallelizing avoids an unnecessary
+        // cross-region round trip on every appointment refresh.
+        const [patients, unreadCounts] = await Promise.all([
+            sql`
+                SELECT p.pid, p.uid, u.name, u.email, u.phone, u.profile_image_url
+                FROM patients p JOIN users u ON p.uid = u.uid
+                WHERE p.pid = ANY(${patientIds}::uuid[])
+            `,
+            // Count unread patient messages for each appointment
+            sql`
+                SELECT aid, COUNT(*)::int as count
+                FROM appointment_messages
+                WHERE aid = ANY(${appointmentIds}::uuid[])
+                  AND sender_role = 'patient'
+                  AND read_at IS NULL
+                GROUP BY aid
+            `,
+        ]);
         const unreadMap = new Map((unreadCounts || []).map((r: any) => [r.aid, Number(r.count)]));
 
         const enrichedAppointments = allAppointments.map((apt: any) => ({
             ...apt, complaint_description: apt.chief_complaint, payment_status: apt.payment_status,
-            unread_messages_count: unreadMap.get(apt.aid) || 0,
+            callAvailable: Boolean(apt.call_available), callOpensAt: apt.call_opens_at, serverTime: apt.server_time,
+            unread_messages_count: unreadMap.get(apt.aid) || 0, unreadMessagesCount: unreadMap.get(apt.aid) || 0,
             patient: (() => {
                 const p = patients?.find(pat => pat.pid === apt.pid);
                 return p ? { pid: p.pid, uid: p.uid, user: { name: p.name, email: p.email, phone: p.phone, profile_image_url: p.profile_image_url } } : null;
@@ -137,33 +187,101 @@ export async function PATCH(request: NextRequest) {
 
         // Mode-only change
         if (mode && !status) {
+            if (mode !== 'online' && await hasOpenCallForAppointment(aid)) {
+                return NextResponse.json({
+                    success: false,
+                    code: 'CALL_IN_PROGRESS',
+                    error: 'End the active call before changing this appointment to in-person.',
+                }, { status: 409 });
+            }
+
             const [data] = await sql`
                 UPDATE appointments SET mode = ${mode} WHERE aid = ${aid} AND did = ${auth.data.did} RETURNING *
             `;
-            try {
-                const [pt] = await sql`
-                    SELECT p.uid as patient_uid, u.name as patient_name 
-                    FROM appointments ap 
-                    JOIN patients p ON ap.pid = p.pid 
-                    JOIN users u ON p.uid = u.uid 
-                    WHERE ap.aid = ${aid}
-                `;
-                const modeLabel = mode === 'online' ? 'Online Video Consultation' : 'In-Clinic Visit';
-                const ptMsg = 'Your appointment mode has been changed to ' + modeLabel + '.';
-                const docMsg = 'Appointment mode with ' + (pt?.patient_name || 'patient') + ' was changed to ' + modeLabel + '.';
 
-                if (pt?.patient_uid) {
-                    await sql`
-                        INSERT INTO notifications (uid, title, body, type, is_read)
-                        VALUES (${pt.patient_uid}, 'Visit Mode Updated', ${ptMsg}, 'mode_change', false)
+            const notified = await notifyPatientBackend({
+                type: 'appointment_status',
+                data: {
+                    appointmentId: aid,
+                    doctorId: auth.data.did,
+                    mode,
+                    updatedAt: data?.updated_at,
+                },
+            });
+
+            if (!notified) {
+                const modeChangedAt = data?.updated_at && !Number.isNaN(new Date(data.updated_at).getTime())
+                    ? new Date(data.updated_at).getTime()
+                    : Date.now();
+                const patientEventKey = `appointment:${aid}:mode:${mode}:${modeChangedAt}`;
+                const doctorEventKey = `doctor:appointment:${aid}:mode:${mode}:${modeChangedAt}`;
+
+                try {
+                    const [pt] = await sql`
+                        SELECT p.uid as patient_uid, p.pid as patient_pid, u.name as patient_name, u.profile_image_url as patient_image
+                        FROM appointments ap 
+                        JOIN patients p ON ap.pid = p.pid 
+                        JOIN users u ON p.uid = u.uid 
+                        WHERE ap.aid = ${aid}
                     `;
+                    const [docUser] = await sql`
+                        SELECT u.name as doctor_name, u.profile_image_url as doctor_image
+                        FROM doctors d
+                        JOIN users u ON d.uid = u.uid
+                        WHERE d.did = ${auth.data.did}
+                    `;
+                    const rawDocName = docUser?.doctor_name || 'your doctor';
+                    const docName = rawDocName.replace(/^Dr\.?\s+/i, '');
+                    const displayDocName = `Dr. ${docName}`;
+                    const doctorImage = docUser?.doctor_image || null;
+                    const patientImage = pt?.patient_image || null;
+                    const patientName = pt?.patient_name || 'patient';
+                    const modeLabel = mode === 'online' ? 'Online Video Consultation' : 'In-Clinic Visit';
+                    const ptMsg = 'Your appointment mode has been changed to ' + modeLabel + '.';
+                    const docMsg = 'Appointment mode with ' + patientName + ' was changed to ' + modeLabel + '.';
+
+                    const patientMeta = {
+                        image_url: doctorImage,
+                        avatar_url: doctorImage,
+                        doctor_name: displayDocName,
+                        did: auth.data.did,
+                        appointment_id: aid,
+                        event_key: patientEventKey,
+                    };
+                    const doctorMeta = {
+                        image_url: patientImage,
+                        avatar_url: patientImage,
+                        patient_name: patientName,
+                        pid: pt?.patient_pid || data.pid,
+                        appointment_id: aid,
+                        event_key: doctorEventKey,
+                    };
+
+                    if (pt?.patient_uid) {
+                        await notifyOnce({
+                            uid: pt.patient_uid,
+                            title: 'Visit Mode Updated',
+                            body: ptMsg,
+                            type: 'appointment',
+                            actionUrl: '/dashboard/appointments',
+                            eventKey: patientEventKey,
+                            metadata: patientMeta,
+                            pushChannelId: PATIENT_PUSH_CHANNEL,
+                        }).catch((err) => console.error('[Push] Mode update push to patient failed:', err));
+                    }
+                    await notifyOnce({
+                        uid: auth.data.uid,
+                        title: 'Visit Mode Updated',
+                        body: docMsg,
+                        type: 'appointment',
+                        actionUrl: '/dashboard',
+                        eventKey: doctorEventKey,
+                        metadata: doctorMeta,
+                        pushChannelId: DOCTOR_PUSH_CHANNEL,
+                    }).catch((err) => console.error('[Push] Mode update push to doctor failed:', err));
+                } catch (notifErr) {
+                    console.error('Mode change notification error:', notifErr);
                 }
-                await sql`
-                    INSERT INTO notifications (uid, title, body, type, is_read)
-                    VALUES (${auth.data.uid}, 'Visit Mode Updated', ${docMsg}, 'mode_change', false)
-                `;
-            } catch (notifErr) {
-                console.error('Mode change notification error:', notifErr);
             }
 
             return NextResponse.json({ success: true, appointment: data });
@@ -177,9 +295,14 @@ export async function PATCH(request: NextRequest) {
         let durationMinutes: number | null = null;
 
         if (status === 'cancelled' || status === 'completed') {
+            const callSession = await closeOpenCallForAppointment(
+                aid,
+                status === 'cancelled' ? 'appointment_cancelled' : 'appointment_completed',
+            );
+            const effectiveCallStart = callSession.acceptedAt || existing.call_started_at;
             callEndedAt = nowIso;
-            if (existing.call_started_at) {
-                const rawMinutes = (new Date(nowIso).getTime() - new Date(existing.call_started_at).getTime()) / 60000;
+            if (effectiveCallStart) {
+                const rawMinutes = (new Date(nowIso).getTime() - new Date(effectiveCallStart).getTime()) / 60000;
                 // duration_minutes / call_duration_minutes are integer columns, and a stale
                 // call_started_at can yield a fractional or absurdly large value.
                 durationMinutes = Math.min(1440, Math.max(0, Math.round(rawMinutes)));
@@ -229,63 +352,114 @@ export async function PATCH(request: NextRequest) {
         }
 
 
-        // In-app notifications for status transitions (confirmed, in_progress, completed, cancelled)
-        try {
-            const [pt] = await sql`
-                SELECT p.uid as patient_uid, u.name as patient_name 
-                FROM appointments ap 
-                JOIN patients p ON ap.pid = p.pid 
-                JOIN users u ON p.uid = u.uid 
-                WHERE ap.aid = ${aid}
-            `;
-            const [docUser] = await sql`
-                SELECT u.name as doctor_name FROM doctors d JOIN users u ON d.uid = u.uid WHERE d.did = ${auth.data.did}
-            `;
-            const docName = docUser?.doctor_name ? ('Dr. ' + docUser.doctor_name) : 'Your doctor';
-            const ptName = pt?.patient_name || 'Patient';
+        // Notify both parties through the patient backend so the matching Expo
+        // push is dispatched too. If that service hop fails, fall back to the
+        // local insert so the in-app feed still reflects the status change.
+        const notified = await notifyPatientBackend({
+            type: 'appointment_status',
+            data: {
+                appointmentId: aid,
+                doctorId: auth.data.did,
+                status,
+                updatedAt: data?.updated_at,
+            },
+        });
 
-            let patientTitle = '';
-            let patientBody = '';
-            let doctorTitle = '';
-            let doctorBody = '';
+        if (!notified) {
+            const patientEventKey = `appointment:${aid}:${status}`;
+            const doctorEventKey = `doctor:appointment:${aid}:${status}`;
 
-            if (status === 'confirmed') {
-                patientTitle = 'Appointment Confirmed';
-                patientBody = docName + ' has confirmed your consultation for ' + data.scheduled_date + ' at ' + data.scheduled_time + '.';
-                doctorTitle = 'Appointment Confirmed';
-                doctorBody = 'You confirmed the appointment with ' + ptName + '.';
-            } else if (status === 'in_progress') {
-                patientTitle = 'Consultation Started';
-                patientBody = docName + ' has started your consultation session.';
-                doctorTitle = 'Consultation In Progress';
-                doctorBody = 'Consultation with ' + ptName + ' is currently in progress.';
-            } else if (status === 'completed') {
-                patientTitle = 'Consultation Completed';
-                patientBody = 'Your consultation with ' + docName + ' has been marked as completed.';
-                doctorTitle = 'Consultation Completed';
-                doctorBody = 'You marked the consultation with ' + ptName + ' as completed.';
-            } else if (status === 'cancelled') {
-                patientTitle = 'Appointment Cancelled';
-                patientBody = docName + ' cancelled the appointment on ' + data.scheduled_date + '. Full refund will be processed.';
-                doctorTitle = 'Appointment Cancelled';
-                doctorBody = 'You cancelled the appointment with ' + ptName + '.';
-            }
-
-            if (patientTitle && pt?.patient_uid) {
-                await sql`
-                    INSERT INTO notifications (uid, title, body, type, is_read)
-                    VALUES (${pt.patient_uid}, ${patientTitle}, ${patientBody}, 'appointment_status', false)
+            try {
+                const [pt] = await sql`
+                    SELECT p.uid as patient_uid, p.pid as patient_pid, u.name as patient_name, u.profile_image_url as patient_image
+                    FROM appointments ap 
+                    JOIN patients p ON ap.pid = p.pid 
+                    JOIN users u ON p.uid = u.uid 
+                    WHERE ap.aid = ${aid}
                 `;
-            }
-
-            if (doctorTitle) {
-                await sql`
-                    INSERT INTO notifications (uid, title, body, type, is_read)
-                    VALUES (${auth.data.uid}, ${doctorTitle}, ${doctorBody}, 'appointment_status', false)
+                const [docUser] = await sql`
+                    SELECT u.name as doctor_name, u.profile_image_url as doctor_image
+                    FROM doctors d
+                    JOIN users u ON d.uid = u.uid
+                    WHERE d.did = ${auth.data.did}
                 `;
+                const rawDocName = docUser?.doctor_name || 'your doctor';
+                const docName = 'Dr. ' + rawDocName.replace(/^Dr\.?\s+/i, '');
+                const ptName = pt?.patient_name || 'Patient';
+                const doctorImage = docUser?.doctor_image || null;
+                const patientImage = pt?.patient_image || null;
+                const patientMeta = {
+                    image_url: doctorImage,
+                    avatar_url: doctorImage,
+                    doctor_name: docName,
+                    did: auth.data.did,
+                    appointment_id: aid,
+                    event_key: patientEventKey,
+                };
+                const doctorMeta = {
+                    image_url: patientImage,
+                    avatar_url: patientImage,
+                    patient_name: ptName,
+                    pid: pt?.patient_pid || data.pid,
+                    appointment_id: aid,
+                    event_key: doctorEventKey,
+                };
+
+                let patientTitle = '';
+                let patientBody = '';
+                let doctorTitle = '';
+                let doctorBody = '';
+
+                if (status === 'confirmed') {
+                    patientTitle = 'Appointment Confirmed';
+                    patientBody = docName + ' has confirmed your consultation for ' + data.scheduled_date + ' at ' + data.scheduled_time + '.';
+                    doctorTitle = 'Appointment Confirmed';
+                    doctorBody = 'You confirmed the appointment with ' + ptName + '.';
+                } else if (status === 'in_progress') {
+                    patientTitle = 'Consultation Started';
+                    patientBody = docName + ' has started your consultation session.';
+                    doctorTitle = 'Consultation In Progress';
+                    doctorBody = 'Consultation with ' + ptName + ' is currently in progress.';
+                } else if (status === 'completed') {
+                    patientTitle = 'Consultation Completed';
+                    patientBody = 'Your consultation with ' + docName + ' has been marked as completed.';
+                    doctorTitle = 'Consultation Completed';
+                    doctorBody = 'You marked the consultation with ' + ptName + ' as completed.';
+                } else if (status === 'cancelled') {
+                    patientTitle = 'Appointment Cancelled';
+                    patientBody = docName + ' cancelled the appointment on ' + data.scheduled_date + '. Full refund will be processed.';
+                    doctorTitle = 'Appointment Cancelled';
+                    doctorBody = 'You cancelled the appointment with ' + ptName + '.';
+                }
+
+                if (patientTitle && pt?.patient_uid) {
+                    await notifyOnce({
+                        uid: pt.patient_uid,
+                        title: patientTitle,
+                        body: patientBody,
+                        type: 'appointment',
+                        actionUrl: '/dashboard/appointments',
+                        eventKey: patientEventKey,
+                        metadata: patientMeta,
+                        pushChannelId: PATIENT_PUSH_CHANNEL,
+                    }).catch((err) => console.error('[Push] Appointment status push to patient failed:', err));
+                }
+
+                if (doctorTitle) {
+                    await notifyOnce({
+                        uid: auth.data.uid,
+                        title: doctorTitle,
+                        body: doctorBody,
+                        type: 'appointment',
+                        actionUrl: '/dashboard',
+                        eventKey: doctorEventKey,
+                        metadata: doctorMeta,
+                        pushChannelId: DOCTOR_PUSH_CHANNEL,
+                    }).catch((err) => console.error('[Push] Appointment status push to doctor failed:', err));
+                }
+            } catch (notifErr) {
+                console.error('Failed to record doctor appointment status notification:', notifErr);
             }
-        } catch (notifErr) {
-            console.error('Failed to record doctor appointment status notification:', notifErr);
         }
 
 

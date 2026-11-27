@@ -1,0 +1,101 @@
+{
+  "expo": {
+    "name": "aurasutra sarthi",
+    "slug": "aurasutra-doctor",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/app-icon-square.png",
+    "scheme": "aurasutradoctor",
+    "userInterfaceStyle": "automatic",
+    "androidNavigationBar": {
+      "barStyle": "light-content",
+      "backgroundColor": "#5C85D9"
+    },
+    "ios": {
+      "icon": "./assets/expo.icon",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app uses the camera for video consultations.",
+        "NSMicrophoneUsageDescription": "This app uses the microphone for video consultations.",
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/images/app-icon.png",
+        "monochromeImage": "./assets/images/app-icon.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.WAKE_LOCK",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS"
+      ],
+      "blockedPermissions": [
+        "android.permission.READ_PHONE_STATE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
+      "package": "com.anonymous.aurasutradoctor"
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-audio",
+      "./plugins/withCleartextTraffic",
+      "expo-dev-client",
+      [
+        "expo-notifications",
+        {
+          "defaultChannel": "doctor-updates-v2",
+          "color": "#208AEF"
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#f6f7f3",
+          "image": "./assets/images/splash-blank.png",
+          "imageWidth": 1,
+          "resizeMode": "contain"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow this app to use your location to help patients find your clinic.",
+          "locationWhenInUsePermission": "Allow this app to use your location to fill your clinic address so patients can find you."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": false
+    },
+    "extra": {
+      "router": {},
+      "clerkPublishableKey": "",
+      "apiUrl": "",
+      "eas": {
+        "projectId": "dd5a8f5f-5b66-4020-8850-9aa927903eb7"
+      }
+    },
+    "owner": "bluxh"
+  }
+}

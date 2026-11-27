@@ -5,28 +5,43 @@ const globalForPostgres = globalThis as unknown as {
 };
 
 // Clean string in case quotes were included in environment
-const rawDbUrl = (process.env.DATABASE_URL || '').replace(/^["']|["']$/g, '');
+const rawDbUrl = (process.env.DATABASE_URL || '').replace(/^[']|[']$/g, '');
 const dbUrl = new URL(rawDbUrl);
 
-// Any private IP (192.168.*, 10.*, 172.16-31.*), localhost, or non-sslmode connection
-const isLocalDb = 
+// Only treat as local if hostname is actually localhost or a private LAN IP.
+// Do NOT check sslmode absence -- the Supabase cloud pooler URL omits that param.
+const isLocalDb =
   ['localhost', '127.0.0.1', '::1'].includes(dbUrl.hostname) ||
   dbUrl.hostname.startsWith('192.168.') ||
   dbUrl.hostname.startsWith('10.') ||
-  dbUrl.searchParams.get('sslmode') === 'disable' ||
-  !dbUrl.searchParams.get('sslmode');
+  dbUrl.searchParams.get('sslmode') === 'disable';
+
+let host = dbUrl.hostname;
+let port = Number(dbUrl.port) || 5432;
+let username = dbUrl.username;
+
+if (host.startsWith('db.') && host.endsWith('.supabase.co')) {
+    const projectRef = host.replace(/^db\./, '').replace(/\.supabase\.co$/, '');
+    host = 'aws-0-ap-south-1.pooler.supabase.com';
+    port = 6543;
+    if (username === 'postgres') {
+        username = 'postgres.' + projectRef;
+    }
+}
 
 const sql = globalForPostgres.sql ?? postgres({
-    host: dbUrl.hostname,
-    port: Number(dbUrl.port) || 5432,
+    host,
+    port,
     database: dbUrl.pathname.replace(/^\//, ''),
-    username: dbUrl.username,
+    username,
     password: decodeURIComponent(dbUrl.password),
     // Local Docker Supabase container does NOT support TLS, so ssl must be false
     ssl: isLocalDb ? false : { rejectUnauthorized: false },
-    max: 10,
-    idle_timeout: 30,
-    connect_timeout: 30,
+    // Supabase transaction pooler (port 6543 / PgBouncer) does not support prepared statements
+    prepare: false,
+    max: 5,
+    idle_timeout: 20,
+    connect_timeout: 10,
 });
 
 if (process.env.NODE_ENV !== 'production') {

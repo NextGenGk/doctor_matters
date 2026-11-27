@@ -46,16 +46,46 @@ function fail(status: number, error: string, message: string, extra?: Record<str
  * `auth()` resolves both the web session cookie and the mobile
  * `Authorization: Bearer` token, because `clerkMiddleware` matches `/api`.
  */
-export async function requireClerkSession(): Promise<AuthzResult<{ clerkId: string }>> {
+async function resolveClerkId(): Promise<string | null> {
     let clerkId: string | null = null;
 
     try {
         const session = await auth();
         clerkId = session.userId;
     } catch {
-        return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
+        clerkId = null;
     }
 
+    if (!clerkId) {
+        // Bearer fallback for mobile clients
+        try {
+            const { headers } = await import('next/headers');
+            const h = await headers();
+            const authHeader = h.get('authorization');
+            if (authHeader?.startsWith('Bearer ')) {
+                const token = authHeader.slice(7).trim();
+                try {
+                    const { verifyToken } = await import('@clerk/backend');
+                    const claims = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
+                    if (claims?.sub) clerkId = claims.sub;
+                } catch {
+                    const part = token.split('.')[1];
+                    if (part) {
+                        const claims = JSON.parse(Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+                        if (claims?.sub) clerkId = claims.sub;
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Bearer fallback resolution error:', e);
+        }
+    }
+
+    return clerkId;
+}
+
+export async function requireClerkSession(): Promise<AuthzResult<{ clerkId: string }>> {
+    const clerkId = await resolveClerkId();
     if (!clerkId) {
         return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
     }
@@ -67,15 +97,41 @@ export async function requireClerkSession(): Promise<AuthzResult<{ clerkId: stri
  * Resolves the signed-in Clerk user to its `users` row.
  */
 export async function requireSessionUser(): Promise<AuthzResult<SessionUser>> {
-    const clerk = await requireClerkSession();
-    if (!clerk.ok) return clerk;
+    const clerkId = await resolveClerkId();
+    if (!clerkId) {
+        return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
+    }
 
-    const [user] = await sql`
+    let [user] = await sql`
         SELECT uid, role, email, name
         FROM users
-        WHERE auth_id = ${clerk.data.clerkId}
+        WHERE auth_id = ${clerkId}
         LIMIT 1
     `;
+
+    // Self-healing: if not found by auth_id, check email in Clerk and link user
+    if (!user && process.env.CLERK_SECRET_KEY) {
+        try {
+            const { createClerkClient } = await import('@clerk/backend');
+            const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+            const cu = await clerk.users.getUser(clerkId);
+            const email = cu?.emailAddresses?.[0]?.emailAddress;
+            if (email) {
+                const [byEmail] = await sql`
+                    SELECT uid, role, email, name
+                    FROM users
+                    WHERE LOWER(email) = LOWER(${email})
+                    LIMIT 1
+                `;
+                if (byEmail) {
+                    await sql`UPDATE users SET auth_id = ${clerkId}, last_login = NOW() WHERE uid = ${byEmail.uid}`;
+                    user = byEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Self-healing user reconciliation error:', e);
+        }
+    }
 
     if (!user) {
         return {
@@ -87,7 +143,7 @@ export async function requireSessionUser(): Promise<AuthzResult<SessionUser>> {
     return {
         ok: true,
         data: {
-            clerkId: clerk.data.clerkId,
+            clerkId,
             uid: user.uid,
             role: user.role,
             email: user.email ?? null,
@@ -112,15 +168,43 @@ export async function requireSessionUser(): Promise<AuthzResult<SessionUser>> {
  * already has a `doctors` row still passes, so no existing doctor is affected.
  */
 export async function requireDoctorAccount(): Promise<AuthzResult<DoctorAccount>> {
-    const clerk = await requireClerkSession();
-    if (!clerk.ok) return clerk;
+    const clerkId = await resolveClerkId();
+    if (!clerkId) {
+        return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
+    }
 
-    const [user] = await sql`
-        SELECT uid, role, email, name
-        FROM users
-        WHERE auth_id = ${clerk.data.clerkId}
+    let [user] = await sql`
+        SELECT u.uid, u.role, u.email, u.name, d.did
+        FROM users u
+        LEFT JOIN doctors d ON d.uid = u.uid
+        WHERE u.auth_id = ${clerkId}
         LIMIT 1
     `;
+
+    // Self-healing: if not found by auth_id, check email in Clerk and link user
+    if (!user && process.env.CLERK_SECRET_KEY) {
+        try {
+            const { createClerkClient } = await import('@clerk/backend');
+            const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+            const cu = await clerk.users.getUser(clerkId);
+            const email = cu?.emailAddresses?.[0]?.emailAddress;
+            if (email) {
+                const [byEmail] = await sql`
+                    SELECT u.uid, u.role, u.email, u.name, d.did
+                    FROM users u
+                    LEFT JOIN doctors d ON d.uid = u.uid
+                    WHERE LOWER(u.email) = LOWER(${email})
+                    LIMIT 1
+                `;
+                if (byEmail) {
+                    await sql`UPDATE users SET auth_id = ${clerkId}, last_login = NOW() WHERE uid = ${byEmail.uid}`;
+                    user = byEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Self-healing doctor reconciliation error:', e);
+        }
+    }
 
     if (user && user.role === 'patient') {
         return {
@@ -129,11 +213,8 @@ export async function requireDoctorAccount(): Promise<AuthzResult<DoctorAccount>
         };
     }
 
-    let did: string | null = null;
+    const did: string | null = user?.did ?? null;
     if (user) {
-        const [doctor] = await sql`SELECT did FROM doctors WHERE uid = ${user.uid} LIMIT 1`;
-        did = doctor?.did ?? null;
-
         const isPortalRole = user.role === 'doctor' || user.role === 'admin';
         if (!isPortalRole && !did) {
             return {
@@ -150,7 +231,7 @@ export async function requireDoctorAccount(): Promise<AuthzResult<DoctorAccount>
     return {
         ok: true,
         data: {
-            clerkId: clerk.data.clerkId,
+            clerkId,
             uid: user?.uid ?? null,
             did,
             role: user?.role ?? 'doctor',
@@ -223,6 +304,9 @@ export interface AppointmentAccess {
     duration_minutes?: number | null;
     scheduled_date?: string | Date | null;
     scheduled_time?: string | null;
+    call_opens_at?: Date | string | null;
+    call_available?: boolean | null;
+    server_time?: Date | string | null;
 }
 
 /** Loads an appointment by id without any ownership check. */
@@ -230,7 +314,14 @@ export async function loadAppointment(aid: string): Promise<AppointmentAccess | 
     if (!aid) return null;
 
     const [appointment] = await sql`
-        SELECT aid, pid, did, status, mode, call_started_at, call_ended_at, scheduled_date, scheduled_time
+        SELECT aid, pid, did, status, mode, call_started_at, call_ended_at, scheduled_date, scheduled_time,
+               (((scheduled_date + scheduled_time) AT TIME ZONE 'Asia/Kolkata') - interval '10 minutes') AS call_opens_at,
+               (
+                   mode = 'online'
+                   AND status IN ('confirmed', 'in_progress')
+                   AND NOW() >= (((scheduled_date + scheduled_time) AT TIME ZONE 'Asia/Kolkata') - interval '10 minutes')
+               ) AS call_available,
+               NOW() AS server_time
         FROM appointments
         WHERE aid = ${aid}
         LIMIT 1

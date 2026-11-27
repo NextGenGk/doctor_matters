@@ -17,6 +17,7 @@ import { useDoctorAppointments } from '@/app/hooks/queries/useDoctorAppointments
 import { useUpdateAppointmentStatus } from '@/app/hooks/mutations/useUpdateAppointmentStatus';
 import { useChangeAppointmentMode } from '@/app/hooks/mutations/useChangeAppointmentMode';
 import VerificationGuard from '@/app/components/VerificationGuard';
+import { useCall } from '@/app/components/CallProvider';
 
 interface Appointment {
   aid: string;
@@ -34,6 +35,8 @@ interface Appointment {
   token_number?: number;
   estimated_wait_minutes?: number;
   cancellation_reason?: string;
+  callAvailable?: boolean;
+  callOpensAt?: string;
   refund_requested?: boolean;
   refund_amount?: number;
   refund_reason?: string;
@@ -61,10 +64,20 @@ function MiniCalendar({ appointments }: { appointments: Appointment[] }) {
   const firstDay = new Date(year, month, 1).getDay();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
 
-  // Count appointments per date
+  // Count active appointments per date (exclude completed and cancelled)
   const aptCountMap = appointments.reduce<Record<string, number>>((acc, a) => {
-    const d = new Date(a.scheduled_date);
-    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    if (!a) return acc;
+    const s = String(a.status || '').toLowerCase();
+    if (s === 'completed' || s === 'complete' || s === 'done' || s === 'cancelled' || s === 'canceled' || s === 'rejected') {
+      return acc;
+    }
+
+    const dateStr = String(a.scheduled_date || '').slice(0, 10);
+    if (!dateStr || !dateStr.includes('-')) return acc;
+    const [y, m, d] = dateStr.split('-').map(Number);
+    if (!y || !m || !d) return acc;
+
+    const key = `${y}-${m - 1}-${d}`;
     acc[key] = (acc[key] || 0) + 1;
     return acc;
   }, {});
@@ -149,6 +162,7 @@ function MiniCalendar({ appointments }: { appointments: Appointment[] }) {
 function AppointmentsContent() {
   const token = useAuthToken();
   const { translate } = useLanguage();
+  const { startCall } = useCall();
   const router = useRouter();
   const searchParams = useSearchParams();
   const tabParam = searchParams.get('tab') as any;
@@ -433,12 +447,13 @@ function AppointmentsContent() {
                             </button>
                           </>
                         )}
-                        {((apt.status === 'confirmed' || apt.status === 'in_progress') || (apt.status === 'scheduled' && apt.mode === 'online')) && (
+                        {((apt.status === 'confirmed' || apt.status === 'in_progress') &&
+                          (apt.mode !== 'online' || Boolean((apt as any).callAvailable))) && (
                           <>
                             <button
                               onClick={() => {
                                 if (apt.mode === 'online') {
-                                  window.location.href = `/dashboard/video-call/${apt.aid}`;
+                                  void startCall(apt.aid);
                                 } else {
                                   router.push(`/dashboard/prescriptions/new?aid=${apt.aid}`);
                                 }
@@ -448,7 +463,7 @@ function AppointmentsContent() {
                               {apt.mode === 'online' ? <Video className="w-3.5 h-3.5" /> : <CheckCircle className="w-3.5 h-3.5" />}
                               <TranslatedText>
                                 {apt.mode === 'online' 
-                                  ? (apt.status === 'in_progress' ? 'Rejoin Call' : 'Join Video Call') 
+                                  ? (apt.status === 'in_progress' ? 'Rejoin Call' : 'Start Video Call') 
                                   : 'Complete Visit'}
                               </TranslatedText>
                             </button>
@@ -534,12 +549,11 @@ function AppointmentsContent() {
           </div>
         </div>
 
-        {/* Mini Calendar */}
+        {/* Mini Calendar - only active/pending/confirmed/today appointments */}
         <MiniCalendar appointments={[
           ...aptsData.pending,
           ...aptsData.confirmed,
           ...aptsData.today,
-          ...aptsData.completed,
         ]} />
 
         {/* Today's Appointments */}
