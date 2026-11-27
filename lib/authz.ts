@@ -102,12 +102,36 @@ export async function requireSessionUser(): Promise<AuthzResult<SessionUser>> {
         return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
     }
 
-    const [user] = await sql`
+    let [user] = await sql`
         SELECT uid, role, email, name
         FROM users
         WHERE auth_id = ${clerkId}
         LIMIT 1
     `;
+
+    // Self-healing: if not found by auth_id, check email in Clerk and link user
+    if (!user && process.env.CLERK_SECRET_KEY) {
+        try {
+            const { createClerkClient } = await import('@clerk/backend');
+            const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+            const cu = await clerk.users.getUser(clerkId);
+            const email = cu?.emailAddresses?.[0]?.emailAddress;
+            if (email) {
+                const [byEmail] = await sql`
+                    SELECT uid, role, email, name
+                    FROM users
+                    WHERE LOWER(email) = LOWER(${email})
+                    LIMIT 1
+                `;
+                if (byEmail) {
+                    await sql`UPDATE users SET auth_id = ${clerkId}, last_login = NOW() WHERE uid = ${byEmail.uid}`;
+                    user = byEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Self-healing user reconciliation error:', e);
+        }
+    }
 
     if (!user) {
         return {
@@ -149,13 +173,38 @@ export async function requireDoctorAccount(): Promise<AuthzResult<DoctorAccount>
         return { ok: false, response: fail(401, 'UNAUTHENTICATED', 'Sign in to continue.') };
     }
 
-    const [user] = await sql`
+    let [user] = await sql`
         SELECT u.uid, u.role, u.email, u.name, d.did
         FROM users u
         LEFT JOIN doctors d ON d.uid = u.uid
         WHERE u.auth_id = ${clerkId}
         LIMIT 1
     `;
+
+    // Self-healing: if not found by auth_id, check email in Clerk and link user
+    if (!user && process.env.CLERK_SECRET_KEY) {
+        try {
+            const { createClerkClient } = await import('@clerk/backend');
+            const clerk = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
+            const cu = await clerk.users.getUser(clerkId);
+            const email = cu?.emailAddresses?.[0]?.emailAddress;
+            if (email) {
+                const [byEmail] = await sql`
+                    SELECT u.uid, u.role, u.email, u.name, d.did
+                    FROM users u
+                    LEFT JOIN doctors d ON d.uid = u.uid
+                    WHERE LOWER(u.email) = LOWER(${email})
+                    LIMIT 1
+                `;
+                if (byEmail) {
+                    await sql`UPDATE users SET auth_id = ${clerkId}, last_login = NOW() WHERE uid = ${byEmail.uid}`;
+                    user = byEmail;
+                }
+            }
+        } catch (e) {
+            console.warn('[authz] Self-healing doctor reconciliation error:', e);
+        }
+    }
 
     if (user && user.role === 'patient') {
         return {
